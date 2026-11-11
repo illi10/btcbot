@@ -1,0 +1,10 @@
+{
+  "mode": "notify",
+  "equity": 500,
+  "risk": "auto",
+  "autoMin": true,
+  "apiKey": "",
+  "apiSecret": "",
+  "privateKeyFile": "",
+  "ntfyTopic": ""
+}
