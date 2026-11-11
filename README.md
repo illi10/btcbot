@@ -14,6 +14,10 @@
 | --- | --- |
 | 狀態 | `cd ~/btcbot-vps && node bot.js status` |
 | 紀錄 | `tail -n 30 ~/btcbot-vps/log.txt` |
-| 切換模式／填金鑰 | `bash ~/btcbot-vps/setmode.sh` |
+| 切換模式／填金鑰／設定資金 | `bash ~/btcbot-vps/setmode.sh`（資金填 0＝跟著合約帳戶餘額） |
 | 更新程式 | `cd ~/btcbot-vps && git pull` |
 | 暫停／恢復 | `systemctl stop btcbot.timer` ／ `systemctl start btcbot.timer` |
+
+## 入金與出金
+
+停用線（帳戶從高點回落）與單日虧損 3% 以「交易淨值指數」計算：程式查詢 Binance 的劃轉紀錄，入金與出金只改變單位數，不影響指數，所以只有交易損益會觸發停用。資金設為 0 時，入金後下一次執行就會以新的帳戶餘額計算部位。

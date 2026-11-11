@@ -151,6 +151,51 @@ async function marketClose(t, qty) {
     newClientOrderId: cid(t.id, "close", Date.now()), newOrderRespType: "RESULT"});
 }
 
+/* ── 入金／出金：用「淨值指數」排除資金劃轉，停用線與單日虧損只反映交易損益 ──
+ * 做法同基金淨值：指數＝權益÷單位數。入金或出金時以當下指數增減單位數，指數不變；交易損益才會讓指數變動。
+ * 劃轉紀錄來自 /fapi/v1/income（TRANSFER 等類型）。查詢失敗時沿用上一次的指數，不會把劃轉誤判成損益。 */
+const FLOW_TYPES = new Set(["TRANSFER", "INTERNAL_TRANSFER", "COIN_SWAP_DEPOSIT", "COIN_SWAP_WITHDRAW", "WELCOME_BONUS"]);
+const FLOW_ASSETS = new Set(["USDT", "USDC", "FDUSD", "BNFCR"]);
+async function newFlows(S, now) {
+  const F = S.flow || (S.flow = {lastT: now, seen: []});
+  let start = F.lastT - 3600000, total = 0, ids = [];   // 往前多查 1 小時，避免交易所紀錄延遲而漏掉（靠 seen 去重）
+  for (let page = 0; page < 10; page++) {
+    const rows = await api("GET", "/fapi/v1/income", {startTime: start, endTime: now, limit: 1000});
+    for (const r of rows) {
+      const key = String(r.tranId) + "|" + r.time + "|" + r.incomeType;
+      if (!FLOW_TYPES.has(r.incomeType) || !FLOW_ASSETS.has(r.asset) || F.seen.includes(key)) continue;
+      total += +r.income; ids.push(key);
+    }
+    if (rows.length < 1000) break;
+    start = Math.max(...rows.map(r => +r.time)) + 1;
+  }
+  return {total, ids};
+}
+async function updateNav(S, equity, now) {
+  if (!(S.nav && S.nav.units > 0)) {                       // 第一次（或舊版狀態）：指數從 1 開始
+    S.nav = {units: Math.max(equity, 1e-9), index: 1, peak: 1};
+    S.flow = {lastT: now, seen: []};
+    try { S.flow.seen = (await newFlows(S, now)).ids; } catch (e) {}   // 起算前的劃轉已含在權益裡，只記下不計入
+    return S.nav;
+  }
+  let fl;
+  try { fl = await newFlows(S, now); }
+  catch (e) { log(`查不到劃轉紀錄，沿用上次淨值：${e.message}`); return S.nav; }
+  const N = S.nav;
+  if (fl.total) {
+    const pre = equity - fl.total;                         // 劃轉前的權益（兩次執行間的交易損益很小，歸在劃轉前）
+    const idx = pre > 0 ? pre / N.units : N.index;
+    N.units = Math.max(N.units + fl.total / idx, 1e-9);
+    log(`偵測到${fl.total > 0 ? "入金" : "出金"} ${Math.abs(fl.total).toFixed(2)}U，已排除於損益之外`);
+    notify(`偵測到${fl.total > 0 ? "入金" : "出金"} ${Math.abs(fl.total).toFixed(2)} U`, `合約帳戶權益約 ${equity.toFixed(2)}U；停用線與單日虧損只計交易損益，不受影響。`);
+  }
+  N.index = equity / N.units;
+  N.peak = Math.max(N.peak || N.index, N.index);
+  S.flow.lastT = now;
+  S.flow.seen = [...S.flow.seen, ...fl.ids].slice(-500);
+  return N;
+}
+
 /* ── ① 對帳：每次執行都做 ── */
 async function reconcile(S) {
   if (!S.trades.length) return;
@@ -347,6 +392,16 @@ async function main() {
   const trade = CFG.mode !== "notify";
   let eq = CFG.equity;
   if (trade) {
+    /* 換了模式或金鑰（例如模擬交易→實盤）：舊帳戶的持倉紀錄與淨值不適用，封存後重新起算 */
+    const tag = CFG.mode + ":" + crypto.createHash("sha1").update(CFG.apiKey).digest("hex").slice(0, 12);
+    if (S.acct && S.acct !== tag) {
+      const arc = path.join(DIR, `state-${S.acct.split(":")[0]}-${Date.now()}.json`);
+      fs.renameSync(STATE_FILE, arc);
+      log(`帳戶已切換（${S.acct.split(":")[0]} → ${CFG.mode}），舊紀錄封存為 ${path.basename(arc)}`);
+      for (const k of Object.keys(S)) delete S[k];
+      Object.assign(S, {trades: [], closed: [], lastBar: 0, day: null});
+    }
+    S.acct = tag;
     await syncTime();
     const dual = await api("GET", "/fapi/v1/positionSide/dual");
     if (dual.dualSidePosition) { notify("⚠ 需改成單向持倉", "App 合約設定 → 持倉模式改為「單向持倉」後才會下單。", true); return; }
@@ -358,10 +413,10 @@ async function main() {
     }
     await reconcile(S);
     const acct = await account();
-    eq = CFG.equity > 0 ? Math.min(CFG.equity, acct.equity) : acct.equity;
-    S.peak = Math.max(S.peak || 0, acct.equity);
+    eq = CFG.equity > 0 ? Math.min(CFG.equity, acct.equity) : acct.equity;   // 資金設 0＝跟著帳戶
+    const N = await updateNav(S, acct.equity, now);
     const day = Math.floor(now / D1);
-    if (!S.day || S.day.d !== day) S.day = {d: day, eq: acct.equity};
+    if (!S.day || S.day.d !== day || S.day.idx === undefined) S.day = {d: day, idx: N.index};
     S.lastEq = acct.equity; saveState(S);
   }
   /* 只在 4 小時收盤後的 30 分鐘內分析與開倉 */
@@ -385,8 +440,8 @@ async function main() {
   const blocks = [];
   if (A.mode === "stop") blocks.push("系統已停用（見網頁最上方）");
   if (A.mode === "paper") blocks.push("不符試行資格");
-  if (trade && S.peak > 0 && S.lastEq <= S.peak * (1 - A.ddStop)) blocks.push(`實際帳戶從高點回落達 ${(A.ddStop * 100).toFixed(0)}%`);
-  if (trade && S.day && S.lastEq <= S.day.eq * (1 - 0.03)) blocks.push("今日虧損已達 3%");
+  if (trade && S.nav && S.nav.index <= S.nav.peak * (1 - A.ddStop)) blocks.push(`實際帳戶（扣除入出金）從高點回落達 ${(A.ddStop * 100).toFixed(0)}%`);
+  if (trade && S.nav && S.day && S.nav.index <= S.day.idx * (1 - 0.03)) blocks.push("今日交易虧損已達 3%");
 
   /* 風險上限：沿用網頁規則，並把已開的實際倉位算進去 */
   const cap = 6 * A.riskPct, coinCap = 3 * A.riskPct;
@@ -433,6 +488,7 @@ async function status() {
   CFG = loadCfg(); BASE = CFG.baseUrl || BASES[CFG.mode] || BASES.live;
   const S = loadState();
   console.log(`模式 ${CFG.mode}｜上次分析 ${S.lastBar ? tpe(S.lastBar + H4) + " 收盤" : "—"}｜狀態 ${S.lastMode || "—"}｜每筆風險 ${S.lastRisk ? (S.lastRisk * 100).toFixed(2) + "%" : "—"}`);
+  if (S.nav) console.log(`交易淨值指數 ${S.nav.index.toFixed(4)}（高點 ${S.nav.peak.toFixed(4)}，回落 ${((S.nav.index / S.nav.peak - 1) * 100).toFixed(1)}%；已排除入出金）`);
   console.log(`持倉中 ${S.trades.length} 筆：`);
   for (const t of S.trades) console.log(`  ${t.sym} ${t.side > 0 ? "多" : "空"} ${t.qtyS} @ ${t.entry}｜止損 ${t.slS}｜止盈 ${t.tpS ?? "—"}｜到期 ${tpe(t.deadline)}`);
   const R = (S.closed || []).map(t => t.R).filter(Number.isFinite);
